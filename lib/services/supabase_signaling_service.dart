@@ -10,6 +10,7 @@ class SupabaseSignalingService {
   String? _currentUserId;
   bool _isConnected = false;
   bool _isDisposed = false;
+  Completer<bool>? _connectionCompleter;
 
   // Callbacks
   SignalingCallback? onUserJoined;
@@ -30,6 +31,7 @@ class SupabaseSignalingService {
     _channel = null;
     _currentRoomId = null;
     _currentUserId = null;
+    _connectionCompleter = null;
     onUserJoined = null;
     onUserLeft = null;
     onOffer = null;
@@ -52,8 +54,27 @@ class SupabaseSignalingService {
     print('SupabaseSignaling: Initialized with userId: $userId');
   }
 
+  // Wait for connection to complete (with timeout)
+  Future<bool> waitForConnection({Duration timeout = const Duration(seconds: 5)}) async {
+    if (_isConnected) return true;
+    if (_connectionCompleter == null) return false;
+
+    try {
+      return await _connectionCompleter!.future.timeout(timeout, onTimeout: () {
+        print('SupabaseSignaling: Connection timeout');
+        return false;
+      });
+    } catch (e) {
+      print('SupabaseSignaling: Error waiting for connection: $e');
+      return false;
+    }
+  }
+
   // Join room - subscribe to room channel
-  void joinRoom(String roomId, Map<String, dynamic> userInfo) {
+  Future<bool> joinRoom(String roomId, Map<String, dynamic> userInfo) async {
+    // Create a new completer for this connection attempt
+    _connectionCompleter = Completer<bool>();
+
     try {
       _currentRoomId = roomId;
 
@@ -67,12 +88,14 @@ class SupabaseSignalingService {
       );
     } catch (e) {
       print('SupabaseSignaling: Error creating channel: $e');
-      return;
+      _connectionCompleter?.complete(false);
+      return false;
     }
 
     if (_channel == null) {
       print('SupabaseSignaling: Channel is null, cannot join room');
-      return;
+      _connectionCompleter?.complete(false);
+      return false;
     }
 
     // Listen for broadcasts
@@ -189,14 +212,27 @@ class SupabaseSignalingService {
         print('SupabaseSignaling: Channel status: $status, error: $error');
         if (status == RealtimeSubscribeStatus.subscribed) {
           _isConnected = true;
+          // Complete the connection completer
+          if (_connectionCompleter != null && !_connectionCompleter!.isCompleted) {
+            _connectionCompleter!.complete(true);
+          }
           // Broadcast that we joined
           _broadcast('user-joined', {
             'userId': _currentUserId,
             'roomId': roomId,
             ...userInfo,
           });
+        } else if (status == RealtimeSubscribeStatus.channelError ||
+                   status == RealtimeSubscribeStatus.closed) {
+          _isConnected = false;
+          if (_connectionCompleter != null && !_connectionCompleter!.isCompleted) {
+            _connectionCompleter!.complete(false);
+          }
         }
       });
+
+    // Wait for the subscription to complete
+    return waitForConnection();
   }
 
   // Broadcast a message to the room
@@ -214,15 +250,32 @@ class SupabaseSignalingService {
   }
 
   // Leave room
-  void leaveRoom(String roomId) {
+  Future<void> leaveRoom(String roomId) async {
     _broadcast('user-left', {
       'userId': _currentUserId,
       'roomId': roomId,
     });
-    _channel?.unsubscribe();
+
+    // Give time for the leave message to be sent
+    await Future.delayed(const Duration(milliseconds: 200));
+
+    try {
+      // Properly remove the channel from Supabase client
+      if (_channel != null) {
+        await SupabaseConfig.client.removeChannel(_channel!);
+      }
+    } catch (e) {
+      print('SupabaseSignaling: Error removing channel: $e');
+      // Fallback to just unsubscribe
+      try {
+        _channel?.unsubscribe();
+      } catch (_) {}
+    }
+
     _channel = null;
     _currentRoomId = null;
     _isConnected = false;
+    print('SupabaseSignaling: Left room $roomId');
   }
 
   // Send WebRTC offer
@@ -279,7 +332,7 @@ class SupabaseSignalingService {
   }
 
   // Disconnect
-  void disconnect() {
+  Future<void> disconnect() async {
     _isDisposed = true;
 
     // Clear all callbacks
@@ -293,12 +346,20 @@ class SupabaseSignalingService {
     onHandRaised = null;
 
     try {
-      _channel?.unsubscribe();
+      // Properly remove the channel from Supabase client
+      if (_channel != null) {
+        await SupabaseConfig.client.removeChannel(_channel!);
+      }
     } catch (e) {
-      print('SupabaseSignaling: Error unsubscribing: $e');
+      print('SupabaseSignaling: Error removing channel: $e');
+      // Fallback to just unsubscribe
+      try {
+        _channel?.unsubscribe();
+      } catch (_) {}
     }
     _channel = null;
     _currentRoomId = null;
     _isConnected = false;
+    print('SupabaseSignaling: Disconnected');
   }
 }

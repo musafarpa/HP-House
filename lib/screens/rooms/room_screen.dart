@@ -203,6 +203,7 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
             return Column(
               children: [
                 _buildTopBar(room, roomProvider, isHost),
+                _buildVoiceStatusBar(roomProvider),
                 Expanded(
                   child: _buildContent(roomProvider, currentUserId, isHost),
                 ),
@@ -211,6 +212,73 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
             );
           },
         ),
+      ),
+    );
+  }
+
+  Widget _buildVoiceStatusBar(RoomProvider provider) {
+    final status = provider.voiceStatus;
+    final message = provider.voiceStatusMessage;
+
+    // Don't show if disconnected and no participants (first user in room)
+    if (status == 'disconnected' && _participants.length <= 1) {
+      return const SizedBox.shrink();
+    }
+
+    Color bgColor;
+    Color textColor;
+    IconData icon;
+
+    switch (status) {
+      case 'connecting':
+        bgColor = _Theme.orange.withAlpha(30);
+        textColor = _Theme.orange;
+        icon = Icons.sync_rounded;
+        break;
+      case 'connected':
+        bgColor = _Theme.green.withAlpha(30);
+        textColor = _Theme.green;
+        icon = Icons.check_circle_rounded;
+        break;
+      case 'failed':
+        bgColor = _Theme.red.withAlpha(30);
+        textColor = _Theme.red;
+        icon = Icons.error_rounded;
+        break;
+      default:
+        bgColor = _Theme.cardElevated;
+        textColor = _Theme.textGray;
+        icon = Icons.wifi_off_rounded;
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      color: bgColor,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          if (status == 'connecting')
+            SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                valueColor: AlwaysStoppedAnimation<Color>(textColor),
+              ),
+            )
+          else
+            Icon(icon, size: 14, color: textColor),
+          const SizedBox(width: 8),
+          Text(
+            message,
+            style: GoogleFonts.plusJakartaSans(
+              color: textColor,
+              fontSize: 12,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
       ),
     );
   }

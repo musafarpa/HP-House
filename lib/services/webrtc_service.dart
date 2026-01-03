@@ -3,9 +3,11 @@ import 'package:flutter_webrtc/flutter_webrtc.dart';
 class WebRTCService {
   final Map<String, RTCPeerConnection> _peerConnections = {};
   final Map<String, RTCVideoRenderer> _remoteRenderers = {};
+  final Set<String> _pendingOfferReceivedFrom = {}; // Track users who sent us offers
 
   MediaStream? _localStream;
   RTCVideoRenderer? _localRenderer;
+  String? _currentUserId; // Our user ID for deterministic offer creation
 
   bool _isAudioEnabled = true;
   bool _isVideoEnabled = true;
@@ -18,6 +20,9 @@ class WebRTCService {
   Function(String targetId, RTCSessionDescription sdp)? onLocalOffer;
   Function(String targetId, RTCSessionDescription sdp)? onLocalAnswer;
   Function(String targetId, RTCIceCandidate candidate)? onIceCandidate;
+  Function(String odiumId)? onConnectionFailed; // Called when ICE connection fails
+  Function(String odiumId)? onConnectionConnected; // Called when ICE connection succeeds
+  Function(String odiumId)? onConnectionConnecting; // Called when ICE is connecting
 
   MediaStream? get localStream => _localStream;
   RTCVideoRenderer? get localRenderer => _localRenderer;
@@ -33,14 +38,32 @@ class WebRTCService {
       {'urls': 'stun:stun.l.google.com:19302'},
       {'urls': 'stun:stun1.l.google.com:19302'},
       {'urls': 'stun:stun2.l.google.com:19302'},
-      // OpenRelay TURN servers (free, for testing)
+      {'urls': 'stun:stun3.l.google.com:19302'},
+      {'urls': 'stun:stun4.l.google.com:19302'},
+      // Metered TURN servers (more reliable)
       {
-        'urls': 'turn:openrelay.metered.ca:80',
-        'username': 'openrelayproject',
-        'credential': 'openrelayproject',
+        'urls': 'turn:a.relay.metered.ca:80',
+        'username': 'e8dd65f92cdd9f4cfe4ce383',
+        'credential': 'Zp+SZP9BLy3rpBqT',
       },
       {
-        'urls': 'turn:openrelay.metered.ca:443',
+        'urls': 'turn:a.relay.metered.ca:80?transport=tcp',
+        'username': 'e8dd65f92cdd9f4cfe4ce383',
+        'credential': 'Zp+SZP9BLy3rpBqT',
+      },
+      {
+        'urls': 'turn:a.relay.metered.ca:443',
+        'username': 'e8dd65f92cdd9f4cfe4ce383',
+        'credential': 'Zp+SZP9BLy3rpBqT',
+      },
+      {
+        'urls': 'turn:a.relay.metered.ca:443?transport=tcp',
+        'username': 'e8dd65f92cdd9f4cfe4ce383',
+        'credential': 'Zp+SZP9BLy3rpBqT',
+      },
+      // OpenRelay TURN servers (backup)
+      {
+        'urls': 'turn:openrelay.metered.ca:80',
         'username': 'openrelayproject',
         'credential': 'openrelayproject',
       },
@@ -49,8 +72,15 @@ class WebRTCService {
         'username': 'openrelayproject',
         'credential': 'openrelayproject',
       },
-    ]
+    ],
+    'iceCandidatePoolSize': 10,
   };
+
+  // Set the current user ID (needed for deterministic offer creation)
+  void setCurrentUserId(String userId) {
+    _currentUserId = userId;
+    print('WebRTCService: Set current user ID to $userId');
+  }
 
   // Reset the service for reuse (call before rejoining a room)
   void reset() {
@@ -60,14 +90,29 @@ class WebRTCService {
     _isSpeakerOn = true;
     _localStream = null;
     _localRenderer = null;
+    _currentUserId = null;
     _peerConnections.clear();
     _remoteRenderers.clear();
+    _pendingOfferReceivedFrom.clear();
     onRemoteStream = null;
     onRemoteStreamRemoved = null;
     onLocalOffer = null;
     onLocalAnswer = null;
     onIceCandidate = null;
+    onConnectionFailed = null;
+    onConnectionConnected = null;
+    onConnectionConnecting = null;
     print('WebRTCService: Reset complete');
+  }
+
+  // Check if we already have a connection with this peer
+  bool hasPeerConnection(String odiumId) {
+    return _peerConnections.containsKey(odiumId);
+  }
+
+  // Check if we received an offer from this peer (to avoid glare)
+  bool hasReceivedOfferFrom(String odiumId) {
+    return _pendingOfferReceivedFrom.contains(odiumId);
   }
 
   // Initialize local media
@@ -216,8 +261,22 @@ class WebRTCService {
       pc.onIceConnectionState = (RTCIceConnectionState state) {
         if (_isDisposed) return;
         print('WebRTCService: ICE state for $odiumId: $state');
-        if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
-            state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+        if (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+            state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+          print('WebRTCService: Connection CONNECTED with $odiumId');
+          onConnectionConnected?.call(odiumId);
+        } else if (state == RTCIceConnectionState.RTCIceConnectionStateChecking) {
+          print('WebRTCService: Connection CONNECTING with $odiumId');
+          onConnectionConnecting?.call(odiumId);
+        } else if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+          print('WebRTCService: Connection FAILED with $odiumId - will retry');
+          // Remove the failed peer and notify for retry
+          _pendingOfferReceivedFrom.remove(odiumId); // Allow new offers
+          _removePeer(odiumId);
+          onConnectionFailed?.call(odiumId);
+        } else if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
+          print('WebRTCService: Connection DISCONNECTED with $odiumId');
+          // For disconnect, just remove the peer (they may have left)
           _removePeer(odiumId);
         }
       };
@@ -233,14 +292,39 @@ class WebRTCService {
   // Create and send offer
   Future<void> createOffer(String targetId) async {
     if (_isDisposed) return;
-    try {
-      RTCPeerConnection? pc;
 
-      if (_peerConnections.containsKey(targetId)) {
-        pc = _peerConnections[targetId];
-      } else {
-        pc = await _createNewPeerConnection(targetId);
+    // Skip if we already received an offer from this user (avoid glare - they initiated first)
+    if (_pendingOfferReceivedFrom.contains(targetId)) {
+      print('WebRTCService.createOffer: Skipping - already received offer from $targetId');
+      return;
+    }
+
+    // Skip if we already have an active connection with this peer
+    if (_peerConnections.containsKey(targetId)) {
+      final existingPc = _peerConnections[targetId];
+      if (existingPc != null) {
+        final state = existingPc.connectionState;
+        if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected ||
+            state == RTCPeerConnectionState.RTCPeerConnectionStateConnecting) {
+          print('WebRTCService.createOffer: Skipping - already connected/connecting to $targetId');
+          return;
+        }
+        // If connection is in a bad state, clean it up first
+        if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
+            state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected ||
+            state == RTCPeerConnectionState.RTCPeerConnectionStateClosed) {
+          print('WebRTCService.createOffer: Cleaning up failed connection to $targetId');
+          await existingPc.close();
+          _peerConnections.remove(targetId);
+          _remoteRenderers[targetId]?.dispose();
+          _remoteRenderers.remove(targetId);
+        }
       }
+    }
+
+    try {
+      print('WebRTCService.createOffer: Creating offer to $targetId (myId: $_currentUserId)');
+      RTCPeerConnection? pc = await _createNewPeerConnection(targetId);
 
       if (pc == null) {
         print('WebRTCService.createOffer: Failed to create peer connection');
@@ -251,6 +335,7 @@ class WebRTCService {
       await pc.setLocalDescription(offer);
 
       onLocalOffer?.call(targetId, offer);
+      print('WebRTCService.createOffer: Offer sent to $targetId');
     } catch (e) {
       print('WebRTCService.createOffer: Error - $e');
     }
@@ -260,10 +345,31 @@ class WebRTCService {
   Future<void> handleOffer(String senderId, Map<String, dynamic> offerData) async {
     if (_isDisposed) return;
     try {
+      // Track that we received an offer from this user (to avoid glare condition)
+      _pendingOfferReceivedFrom.add(senderId);
+      print('WebRTCService.handleOffer: Received offer from $senderId (myId: $_currentUserId)');
+
       RTCPeerConnection? pc;
 
+      // Check if we have an existing connection
       if (_peerConnections.containsKey(senderId)) {
-        pc = _peerConnections[senderId];
+        final existingPc = _peerConnections[senderId]!;
+        final state = existingPc.connectionState;
+
+        // If existing connection is good, use it
+        if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected ||
+            state == RTCPeerConnectionState.RTCPeerConnectionStateConnecting) {
+          print('WebRTCService.handleOffer: Already have active connection to $senderId, using existing');
+          pc = existingPc;
+        } else {
+          // Clean up bad connection and create new one
+          print('WebRTCService.handleOffer: Cleaning up old connection to $senderId (state: $state)');
+          await existingPc.close();
+          _peerConnections.remove(senderId);
+          _remoteRenderers[senderId]?.dispose();
+          _remoteRenderers.remove(senderId);
+          pc = await _createNewPeerConnection(senderId);
+        }
       } else {
         pc = await _createNewPeerConnection(senderId);
       }
@@ -284,6 +390,7 @@ class WebRTCService {
       await pc.setLocalDescription(answer);
 
       onLocalAnswer?.call(senderId, answer);
+      print('WebRTCService.handleOffer: Answer sent to $senderId');
     } catch (e) {
       print('WebRTCService.handleOffer: Error - $e');
     }
@@ -466,6 +573,9 @@ class WebRTCService {
     onLocalOffer = null;
     onLocalAnswer = null;
     onIceCandidate = null;
+    onConnectionFailed = null;
+    onConnectionConnected = null;
+    onConnectionConnecting = null;
 
     // Close all peer connections
     try {

@@ -25,6 +25,13 @@ class RoomProvider with ChangeNotifier {
   StreamSubscription? _participantsSubscription;
   Timer? _participantsRefreshTimer;
 
+  // Voice connection status tracking
+  String _voiceStatus = 'disconnected'; // disconnected, connecting, connected, failed
+  int _connectedPeers = 0;
+  int _failedPeers = 0;
+  final Set<String> _connectedPeerIds = {};
+  final Set<String> _connectingPeerIds = {};
+
   List<RoomModel> get allRooms => _allRooms;
   List<RoomModel> get liveRooms => _allRooms.where((r) => r.isLive).toList();
   RoomModel? get currentRoom => _currentRoom;
@@ -34,6 +41,26 @@ class RoomProvider with ChangeNotifier {
   bool get isMuted => _isMuted;
   bool get hasRaisedHand => _hasRaisedHand;
   bool get isSpeakerOn => _webrtc.isSpeakerOn;
+
+  // Voice connection status getters
+  String get voiceStatus => _voiceStatus;
+  int get connectedPeers => _connectedPeers;
+  int get failedPeers => _failedPeers;
+  bool get isVoiceConnected => _voiceStatus == 'connected';
+  bool get isVoiceConnecting => _voiceStatus == 'connecting';
+  bool get isVoiceFailed => _voiceStatus == 'failed';
+  String get voiceStatusMessage {
+    switch (_voiceStatus) {
+      case 'connecting':
+        return 'Connecting voice...';
+      case 'connected':
+        return 'Voice connected ($_connectedPeers peers)';
+      case 'failed':
+        return 'Voice failed ($_failedPeers peers)';
+      default:
+        return 'Voice disconnected';
+    }
+  }
 
   List<ParticipantModel> get speakers =>
       _participants.where((p) => p.isSpeaker).toList();
@@ -211,6 +238,7 @@ class RoomProvider with ChangeNotifier {
       // Reset services before initializing (in case they were previously disposed)
       _webrtc.reset();
       _signaling.reset();
+      _resetVoiceStatus(); // Reset voice status for fresh start
       debugPrint('RoomProvider.joinRoom: Services reset');
 
       // Initialize WebRTC for audio only - wrap in try-catch
@@ -234,22 +262,33 @@ class RoomProvider with ChangeNotifier {
       }
       _isMuted = true;
 
+      // Set user ID on WebRTC for deterministic offer creation (after init to be safe)
+      _webrtc.setCurrentUserId(userId);
+
+      // Set up signaling callbacks BEFORE joining (so we don't miss any messages)
+      _setupSignalingCallbacks();
+
+      // Set up WebRTC callbacks BEFORE joining
+      _setupWebRTCCallbacks();
+
       // Connect to signaling server - wrap in try-catch
+      bool signalingConnected = false;
       try {
         await _signaling.connect(userId, '');
-        _signaling.joinRoom(roomId, {
+        // joinRoom now waits for the channel to be subscribed
+        signalingConnected = await _signaling.joinRoom(roomId, {
           'userId': userId,
         });
+        debugPrint('RoomProvider.joinRoom: Signaling connected=$signalingConnected');
+
+        // Wait a bit for the user-joined broadcast to be received by other users
+        if (signalingConnected) {
+          await Future.delayed(const Duration(milliseconds: 500));
+        }
       } catch (e) {
         debugPrint('RoomProvider.joinRoom: Signaling error: $e');
         // Continue without signaling
       }
-
-      // Set up signaling callbacks
-      _setupSignalingCallbacks();
-
-      // Set up WebRTC callbacks
-      _setupWebRTCCallbacks();
 
       // Load initial participants with retry
       debugPrint('RoomProvider.joinRoom: Loading initial participants');
@@ -267,21 +306,34 @@ class RoomProvider with ChangeNotifier {
       debugPrint('RoomProvider.joinRoom: Final participant count: ${_participants.length}');
 
       // Create offers to all existing participants (except self)
-      // Only if WebRTC was initialized successfully
-      if (webrtcInitialized) {
+      // Only if WebRTC was initialized successfully AND signaling is connected
+      if (webrtcInitialized && signalingConnected) {
         try {
-          for (final participant in _participants) {
-            if (participant.odiumId != userId) {
+          // Small delay to ensure all services are fully ready
+          await Future.delayed(const Duration(milliseconds: 300));
+
+          final otherParticipants = _participants.where((p) => p.odiumId != userId).toList();
+          if (otherParticipants.isNotEmpty) {
+            // Set voice status to connecting
+            _voiceStatus = 'connecting';
+            _safeNotifyListeners();
+
+            for (final participant in otherParticipants) {
               debugPrint('RoomProvider.joinRoom: Creating offer to existing participant: ${participant.odiumId}');
+              _connectingPeerIds.add(participant.odiumId);
               await _webrtc.createOffer(participant.odiumId);
+              // Small delay between offers to prevent overwhelming
+              await Future.delayed(const Duration(milliseconds: 100));
             }
+            _updateVoiceStatus();
+            _safeNotifyListeners();
           }
         } catch (e) {
           debugPrint('RoomProvider.joinRoom: Error creating offers: $e');
           // Continue anyway - voice may not work but app won't crash
         }
       } else {
-        debugPrint('RoomProvider.joinRoom: Skipping offers - WebRTC not initialized');
+        debugPrint('RoomProvider.joinRoom: Skipping offers - WebRTC initialized=$webrtcInitialized, signaling connected=$signalingConnected');
       }
 
       // Cancel any existing subscription and watch for participant changes
@@ -324,9 +376,16 @@ class RoomProvider with ChangeNotifier {
       final userId = currentUserId;
       final isHost = _currentRoom?.hostId == userId;
 
+      // Cancel participants subscription and timer first
+      _participantsSubscription?.cancel();
+      _participantsSubscription = null;
+      _participantsRefreshTimer?.cancel();
+      _participantsRefreshTimer = null;
+
       if (roomId != null && userId != null) {
         await _db.leaveRoom(roomId, userId);
-        _signaling.leaveRoom(roomId);
+        // Await the signaling leave to ensure proper cleanup
+        await _signaling.leaveRoom(roomId);
 
         // Only end room if explicitly requested by host
         if (isHost && endRoom) {
@@ -336,25 +395,27 @@ class RoomProvider with ChangeNotifier {
         }
       }
 
-      // Cancel participants subscription and timer
-      _participantsSubscription?.cancel();
-      _participantsSubscription = null;
-      _participantsRefreshTimer?.cancel();
-      _participantsRefreshTimer = null;
-
-      // Cleanup WebRTC
+      // Cleanup WebRTC - await to ensure all connections are closed
       await _webrtc.dispose();
 
-      _signaling.disconnect();
+      // Disconnect signaling
+      await _signaling.disconnect();
+
+      // Reset voice status
+      _resetVoiceStatus();
+
       _currentRoom = null;
       _participants = [];
       _isMuted = true;
       _hasRaisedHand = false;
       _safeNotifyListeners();
 
+      debugPrint('RoomProvider: Left room successfully, all resources cleaned up');
+
       // Refresh live rooms
       loadLiveRooms();
     } catch (e) {
+      debugPrint('RoomProvider: Error leaving room: $e');
       _error = 'Failed to leave room';
       _safeNotifyListeners();
     }
@@ -610,8 +671,76 @@ class RoomProvider with ChangeNotifier {
     _webrtc.onRemoteStreamRemoved = (odiumId) {
       if (_isDisposed) return;
       debugPrint('Remote stream removed from $odiumId');
+      _connectedPeerIds.remove(odiumId);
+      _connectingPeerIds.remove(odiumId);
+      _updateVoiceStatus();
       _safeNotifyListeners();
     };
+
+    // Handle connection state changes
+    _webrtc.onConnectionConnecting = (odiumId) {
+      if (_isDisposed) return;
+      debugPrint('RoomProvider: Connecting to $odiumId');
+      _connectingPeerIds.add(odiumId);
+      _updateVoiceStatus();
+      _safeNotifyListeners();
+    };
+
+    _webrtc.onConnectionConnected = (odiumId) {
+      if (_isDisposed) return;
+      debugPrint('RoomProvider: Connected to $odiumId');
+      _connectingPeerIds.remove(odiumId);
+      _connectedPeerIds.add(odiumId);
+      _updateVoiceStatus();
+      _safeNotifyListeners();
+    };
+
+    // Handle connection failures - retry after a delay
+    _webrtc.onConnectionFailed = (odiumId) {
+      if (_isDisposed) return;
+      debugPrint('RoomProvider: Connection failed with $odiumId, retrying in 2 seconds...');
+      _connectingPeerIds.remove(odiumId);
+      _connectedPeerIds.remove(odiumId);
+      _failedPeers++;
+      _updateVoiceStatus();
+      _safeNotifyListeners();
+
+      Future.delayed(const Duration(seconds: 2), () {
+        if (_isDisposed) return;
+        if (_currentRoom != null) {
+          debugPrint('RoomProvider: Retrying connection to $odiumId');
+          _connectingPeerIds.add(odiumId);
+          _updateVoiceStatus();
+          _safeNotifyListeners();
+          _webrtc.createOffer(odiumId);
+        }
+      });
+    };
+  }
+
+  // Update voice connection status based on peer states
+  void _updateVoiceStatus() {
+    _connectedPeers = _connectedPeerIds.length;
+
+    if (_connectedPeerIds.isNotEmpty) {
+      _voiceStatus = 'connected';
+    } else if (_connectingPeerIds.isNotEmpty) {
+      _voiceStatus = 'connecting';
+    } else if (_failedPeers > 0 && _connectedPeerIds.isEmpty) {
+      _voiceStatus = 'failed';
+    } else {
+      _voiceStatus = 'disconnected';
+    }
+    debugPrint('RoomProvider: Voice status=$_voiceStatus, connected=$_connectedPeers, connecting=${_connectingPeerIds.length}, failed=$_failedPeers');
+  }
+
+  // Reset voice connection status
+  void _resetVoiceStatus() {
+    _voiceStatus = 'disconnected';
+    _connectedPeers = 0;
+    _failedPeers = 0;
+    _connectedPeerIds.clear();
+    _connectingPeerIds.clear();
   }
 
   // Load participants with user details
