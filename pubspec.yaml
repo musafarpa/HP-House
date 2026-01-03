@@ -1,0 +1,52 @@
+name: hp_house
+description: "HP House - Social Audio/Video App like Clubhouse"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Icons
+  cupertino_icons: ^1.0.8
+
+  # State Management
+  provider: ^6.1.1
+
+  # Supabase
+  supabase_flutter: ^2.3.0
+
+  # WebRTC for Audio/Video
+  flutter_webrtc: ^0.12.4
+  socket_io_client: ^2.0.3+1
+
+  # UI Components
+  google_fonts: ^6.1.0
+  cached_network_image: ^3.3.1
+  flutter_svg: ^2.0.9
+  shimmer: ^3.0.0
+
+  # Utilities
+  uuid: ^4.3.3
+  intl: ^0.19.0
+  permission_handler: ^11.2.0
+  image_picker: ^1.0.7
+
+  # Google Sign-In (for Supabase OAuth)
+  google_sign_in: ^6.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/
+    - assets/icons/
